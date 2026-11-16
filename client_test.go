@@ -175,7 +175,40 @@ func TestGetAirportHTTPError(t *testing.T) {
 
 	airport, err := client.GetAirport("KJFK")
 
-	assert.True(t, airport == nil || err != nil, "expected error or nil airport for 500 response")
+	require.Error(t, err)
+	assert.Nil(t, airport)
+	assert.Contains(t, err.Error(), "status 500")
+	assert.Contains(t, err.Error(), "server error")
+}
+
+// TestGetAirportRateLimited reproduces airportdb.io's actual rate-limit
+// response: a 429 with a well-formed JSON body that doesn't share any fields
+// with Airport. Without a status code check, this decodes silently into a
+// zero-valued Airport instead of surfacing the real error.
+func TestGetAirportRateLimited(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"statusCode": 429,
+			"error":      "Too many requests",
+			"message":    "Rate limit exceeded",
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		logger: zap.NewNop(),
+		URL:    server.URL,
+		Key:    "test-key",
+	}
+
+	airport, err := client.GetAirport("YBBN")
+
+	require.Error(t, err)
+	assert.Nil(t, airport)
+	assert.Contains(t, err.Error(), "status 429")
+	assert.Contains(t, err.Error(), "Rate limit exceeded")
 }
 
 func TestCloseResponseBody(t *testing.T) {
