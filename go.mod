@@ -1,4 +1,4 @@
-module github.com/deanstalker-stream/airport-db-client
+module github.com/aviation-tragic-au/airport-db-client
 
 go 1.26.2
 
