@@ -67,6 +67,10 @@ func (c *Client) GetAirport(icao string) (*Airport, error) {
 		return nil, fmt.Errorf("unable to read response body: %w", err)
 	}
 
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("airportdb request failed with status %d: %s", res.StatusCode, string(body))
+	}
+
 	var output *Airport
 	if err := json.Unmarshal(body, &output); err != nil {
 		return nil, fmt.Errorf("unable to parse response JSON: %w", err)
