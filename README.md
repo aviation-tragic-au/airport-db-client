@@ -6,10 +6,18 @@ Provides a client for the AirportDB API.
 
 https://airportdb.io/
 
+## Install
+
+```sh
+go get github.com/aviation-tragic-au/airport-db-client
+```
+
 ## Usage
 
 ```go
 import (
+    "context"
+    "errors"
     "log"
 
     airportdb "github.com/aviation-tragic-au/airport-db-client"
@@ -19,24 +27,33 @@ import (
 func main() {
     logger, _ := zap.NewProduction()
 
-    cfg := &airportdb.Config{
-        URL: "https://api.airportdb.io",
-        Key: "your-api-key",
-    }
-
-    client, err := airportdb.NewClient(logger, cfg)
+    // URL defaults to https://airportdb.io/api/v1/airport. Set KeyFunc
+    // instead of Key to look the key up on every request (to pick up a key
+    // changed at runtime), and HTTPClient to use your own transport or
+    // timeout (the default times out after 10 seconds).
+    client, err := airportdb.NewClient(logger, airportdb.Config{
+        Key: "your-api-token",
+    })
     if err != nil {
         log.Fatal(err)
     }
 
-    airport, err := client.GetAirport("KJFK")
-    if err != nil {
+    airport, err := client.GetAirport(context.Background(), "YBBN")
+    switch {
+    case errors.Is(err, airportdb.ErrNotFound):
+        log.Print("AirportDB doesn't have that airport")
+    case err != nil:
         log.Fatal(err)
+    default:
+        log.Printf("Airport: %s (%s)", airport.Name, airport.ICAOCode)
     }
-
-    log.Printf("Airport: %s (%s)", airport.Name, airport.ICAOCode)
 }
 ```
+
+`GetAirport` returns `ErrNotFound` for a 404, and for the empty record
+AirportDB sometimes answers with instead. Any other non-200 response
+(a rate-limited 429, say) is an error carrying the status and the start of
+the body.
 
 ## Contributing
 
