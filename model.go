@@ -1,11 +1,5 @@
 package airportdb
 
-// Config represents the configuration for the airportdb API.
-type Config struct {
-	URL string `json:"url" mapstructure:"url"`
-	Key string `json:"key" mapstructure:"key"`
-}
-
 // Airport represents an airport from the airport database.
 type Airport struct {
 	Ident            string      `json:"ident"`

@@ -1,219 +1,168 @@
 package airportdb
 
 import (
-	"encoding/json"
-	"io"
+	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
-// TestNewClient tests the creation of a new Client via NewClient
 func TestNewClient(t *testing.T) {
-	client, err := NewClient(zap.NewNop(), &Config{URL: "https://api.airportdb.io", Key: "test-key"})
+	t.Run("defaults", func(t *testing.T) {
+		c, err := NewClient(nil, Config{Key: "k"})
+		require.NoError(t, err)
+		assert.Equal(t, DefaultURL, c.url)
+		assert.Equal(t, DefaultTimeout, c.httpClient.Timeout)
+		assert.Equal(t, "k", c.key())
+	})
 
-	require.NoError(t, err)
-	assert.NotNil(t, client)
-	assert.Equal(t, "https://api.airportdb.io", client.URL)
-	assert.Equal(t, "test-key", client.Key)
+	t.Run("trailing slash trimmed", func(t *testing.T) {
+		c, err := NewClient(nil, Config{URL: "https://example.test/api/", Key: "k"})
+		require.NoError(t, err)
+		assert.Equal(t, "https://example.test/api", c.url)
+	})
+
+	t.Run("invalid URL", func(t *testing.T) {
+		_, err := NewClient(nil, Config{URL: "http://bad\x7f", Key: "k"})
+		require.Error(t, err)
+	})
+
+	t.Run("own HTTP client", func(t *testing.T) {
+		hc := &http.Client{}
+		c, err := NewClient(nil, Config{Key: "k", HTTPClient: hc})
+		require.NoError(t, err)
+		assert.Same(t, hc, c.httpClient)
+	})
 }
 
-func TestGetRequestURLConstruction(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.airportdb.io",
-		Key:    "test-key",
-	}
-
+func TestGetAirport(t *testing.T) {
 	tests := []struct {
-		name     string
-		path     string
-		expected string
+		name    string
+		icao    string
+		status  int
+		body    string
+		wantErr error  // matched with errors.Is
+		errText string // a substring of the error, when wantErr is nil
+		want    string // the airport's name on success
 	}{
-		{"simple path", "KJFK", "https://api.airportdb.io/KJFK"},
-		{"path with numbers", "KJFK123", "https://api.airportdb.io/KJFK123"},
+		{name: "found", icao: "YBBN", status: 200, body: `{"ident":"YBBN","icao_code":"YBBN","name":"Brisbane"}`, want: "Brisbane"},
+		{name: "404", icao: "ZZZZ", status: 404, body: `{}`, wantErr: ErrNotFound},
+		{name: "empty record", icao: "YSWS", status: 200, body: `{"ident":"","name":""}`, wantErr: ErrNotFound},
+		{name: "null", icao: "YSWS", status: 200, body: `null`, wantErr: ErrNotFound},
+		{
+			// airportdb.io's rate limit: a 429 whose JSON body shares no
+			// fields with Airport.
+			name: "rate limited", icao: "YBBN", status: 429,
+			body:    `{"statusCode":429,"error":"Too many requests","message":"Rate limit exceeded"}`,
+			errText: "status 429",
+		},
+		{name: "server error", icao: "YBBN", status: 500, body: "server error", errText: "status 500: server error"},
+		{name: "invalid JSON", icao: "YBBN", status: 200, body: "not json", errText: "unable to parse response"},
+		{name: "no code", icao: "  ", errText: "ICAO code is required"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req, err := client.getRequest(tt.path)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, "/api/"+tt.icao, r.URL.Path)
+				assert.Equal(t, "secret", r.URL.Query().Get(apiTokenKey))
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
 
+			c, err := NewClient(nil, Config{URL: srv.URL + "/api", Key: "secret"})
 			require.NoError(t, err)
-			assert.Equal(t, tt.expected, req.URL.String())
-			assert.Equal(t, "GET", req.Method)
+
+			airport, err := c.GetAirport(context.Background(), tt.icao)
+
+			switch {
+			case tt.wantErr != nil:
+				require.ErrorIs(t, err, tt.wantErr)
+				assert.Nil(t, airport)
+			case tt.errText != "":
+				require.ErrorContains(t, err, tt.errText)
+				assert.Nil(t, airport)
+			default:
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, airport.Name)
+			}
 		})
 	}
 }
 
-func TestAddAPIToken(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.airportdb.io",
-		Key:    "secret-test-key",
-	}
-
-	req, _ := client.getRequest("KJFK")
-	client.addAPIToken(req)
-
-	assert.Equal(t, "secret-test-key", req.URL.Query().Get(apiTokenKey))
-}
-
-func TestGetRequestInvalidURL(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "ht!tp://invalid",
-		Key:    "test-key",
-	}
-
-	_, err := client.getRequest("KJFK")
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to create request")
-}
-
-func TestAddAPITokenMultipleParams(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "https://api.airportdb.io",
-		Key:    "test-key",
-	}
-
-	req, _ := client.getRequest("KJFK")
-
-	query := req.URL.Query()
-	query.Add("existing", "value")
-	req.URL.RawQuery = query.Encode()
-
-	client.addAPIToken(req)
-
-	finalQuery := req.URL.Query()
-	assert.Equal(t, "value", finalQuery.Get("existing"))
-	assert.Equal(t, "test-key", finalQuery.Get(apiTokenKey))
-}
-
-func TestGetAirportSuccess(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get(apiTokenKey) == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		err := json.NewEncoder(w).Encode(map[string]interface{}{"name": "John F Kennedy International Airport"})
-		if err != nil {
-			return
-		}
+func TestGetAirportEscapesCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/a%2Fb", r.URL.RawPath)
+		w.WriteHeader(http.StatusNotFound)
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	airport, err := client.GetAirport("KJFK")
-
+	c, err := NewClient(nil, Config{URL: srv.URL, Key: "k"})
 	require.NoError(t, err)
-	assert.NotNil(t, airport)
+
+	_, err = c.GetAirport(context.Background(), "a/b")
+	require.ErrorIs(t, err, ErrNotFound)
 }
 
-func TestGetAirportNetworkError(t *testing.T) {
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    "http://invalid-unreachable-domain.test",
-		Key:    "test-key",
-	}
-
-	_, err := client.GetAirport("KJFK")
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unable to fetch airport data")
-}
-
-func TestGetAirportInvalidJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte("invalid json"))
-		if err != nil {
-			return
-		}
+func TestKeyFuncReadPerRequest(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.Query().Get(apiTokenKey))
+		w.WriteHeader(http.StatusNotFound)
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	_, err := client.GetAirport("KJFK")
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unable to parse response JSON")
-}
-
-func TestGetAirportHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		_, err := io.WriteString(w, "server error")
-		if err != nil {
-			return
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	airport, err := client.GetAirport("KJFK")
-
-	require.Error(t, err)
-	assert.Nil(t, airport)
-	assert.Contains(t, err.Error(), "status 500")
-	assert.Contains(t, err.Error(), "server error")
-}
-
-// TestGetAirportRateLimited reproduces airportdb.io's actual rate-limit
-// response: a 429 with a well-formed JSON body that doesn't share any fields
-// with Airport. Without a status code check, this decodes silently into a
-// zero-valued Airport instead of surfacing the real error.
-func TestGetAirportRateLimited(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"statusCode": 429,
-			"error":      "Too many requests",
-			"message":    "Rate limit exceeded",
-		})
-	}))
-	defer server.Close()
-
-	client := &Client{
-		logger: zap.NewNop(),
-		URL:    server.URL,
-		Key:    "test-key",
-	}
-
-	airport, err := client.GetAirport("YBBN")
-
-	require.Error(t, err)
-	assert.Nil(t, airport)
-	assert.Contains(t, err.Error(), "status 429")
-	assert.Contains(t, err.Error(), "Rate limit exceeded")
-}
-
-func TestCloseResponseBody(t *testing.T) {
-	body := io.NopCloser(strings.NewReader("test"))
-	assert.NotPanics(t, func() {
-		_ = body.Close()
+	var n atomic.Int32
+	keys := []string{"first", "second"}
+	c, err := NewClient(nil, Config{
+		URL:     srv.URL,
+		Key:     "ignored",
+		KeyFunc: func() string { return keys[n.Add(1)-1] },
 	})
+	require.NoError(t, err)
+
+	_, _ = c.GetAirport(context.Background(), "YBBN")
+	_, _ = c.GetAirport(context.Background(), "YBBN")
+
+	assert.Equal(t, []string{"first", "second"}, seen)
+}
+
+func TestGetAirportNoKey(t *testing.T) {
+	c, err := NewClient(nil, Config{URL: "http://unused.test", KeyFunc: func() string { return "" }})
+	require.NoError(t, err)
+
+	_, err = c.GetAirport(context.Background(), "YBBN")
+	require.ErrorContains(t, err, "no API key set")
+}
+
+func TestGetAirportCancelled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c, err := NewClient(nil, Config{URL: srv.URL, Key: "k"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err = c.GetAirport(ctx, "YBBN")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestQuoteTruncates(t *testing.T) {
+	long := make([]byte, maxErrorBody+100)
+	for i := range long {
+		long[i] = 'x'
+	}
+	q := quote(long)
+	assert.Len(t, q, maxErrorBody+3)
+	assert.Equal(t, "...", q[len(q)-3:])
 }
